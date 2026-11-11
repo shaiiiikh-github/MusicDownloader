@@ -1,0 +1,94 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# User configuration & credentials (holds Spotify tokens, paths)
+config.json
+
+# Audio downloads & output folders
+DOWNLOAD/
+downloads/
+*.mp3
+*.m4a
+*.opus
+*.flac
+*.wav
+*.ogg
+*.webm
+
+# Temporary yt-dlp & media download artifacts
+*.part
+*.ytdl
+*.temp
+*.orig
+*_failed_tracks.csv
+
+# Bundled binaries (if placed locally)
+aria2c.exe
+aria2c
+ffmpeg.exe
+ffmpeg
+ffprobe.exe
+ffprobe
+
+# IDEs & editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+.DS_Store
+.Spotlight-V100
+.Trashes
+
