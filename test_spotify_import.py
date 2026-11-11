@@ -4,11 +4,13 @@ import csv
 import json
 from pathlib import Path
 from spotify_import import (
+    DownloadHistoryManager,
     SpotifyPKCEAuth,
     SpotifyTrack,
     build_fast_ytdl_opts,
     export_failed_tracks_csv,
     extract_spotify_playlist_id,
+    get_download_history,
     match_track_to_youtube,
     parse_embed_json,
     parse_exportify_csv,
@@ -301,3 +303,61 @@ def test_match_track_mock_ydl():
     assert cand is not None
     assert cand["id"] == "vid1"
     assert score > 100
+
+
+def test_download_history_manager(tmp_path: Path):
+    hist_file = tmp_path / "history.json"
+    mgr = DownloadHistoryManager(hist_file)
+
+    # 1. Test key normalization
+    assert mgr.normalize_key("Queen", "Bohemian Rhapsody (Remastered 2011)") == "queen:bohemianrhapsody"
+    assert mgr.normalize_key("The Weeknd", "Blinding Lights - Official Audio") == "theweeknd:blindinglights"
+    assert mgr.normalize_key("", "Lone Song (HD)") == "lonesong"
+
+    # 2. Record by Spotify ID and check
+    mgr.record_download(
+        title="Bohemian Rhapsody",
+        artist="Queen",
+        spotify_id="spotify_123",
+        youtube_id="yt_123",
+        file_path="C:/Downloads/Queen - Bohemian Rhapsody.mp3",
+    )
+    assert mgr.count() >= 1
+
+    # Check by Spotify ID
+    is_dl, rec = mgr.is_downloaded(spotify_id="spotify_123")
+    assert is_dl is True
+    assert rec["title"] == "Bohemian Rhapsody"
+
+    # Check by YouTube ID
+    is_dl, rec = mgr.is_downloaded(youtube_id="yt_123")
+    assert is_dl is True
+
+    # Check by normalized title & artist variant
+    is_dl, rec = mgr.is_downloaded(title="Bohemian Rhapsody (2011 Remaster)", artist="Queen")
+    assert is_dl is True
+
+    # Check by "Artist - Title" combined string
+    is_dl, rec = mgr.is_downloaded(title="Queen - Bohemian Rhapsody")
+    assert is_dl is True
+
+    # Non-existent track
+    is_dl, rec = mgr.is_downloaded(title="Nonexistent Track", artist="Nobody")
+    assert is_dl is False
+
+    # 3. Test scanning and indexing a folder
+    downloads_dir = tmp_path / "music_folder"
+    downloads_dir.mkdir()
+    song_file = downloads_dir / "Eagles - Hotel California.mp3"
+    song_file.write_bytes(b"0" * 2048)
+
+    added = mgr.scan_and_index_folder(downloads_dir)
+    assert added == 1
+    is_dl, _ = mgr.is_downloaded(title="Hotel California", artist="Eagles")
+    assert is_dl is True
+
+    # 4. Test clear
+    mgr.clear()
+    assert mgr.count() == 0
+    is_dl, _ = mgr.is_downloaded(spotify_id="spotify_123")
+    assert is_dl is False

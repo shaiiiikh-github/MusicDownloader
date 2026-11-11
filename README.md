@@ -16,6 +16,7 @@ A lightweight desktop audio downloader built with Python, CustomTkinter, `yt-dlp
 - **Transcoding bypass**: Skips re-encoding when chosen format matches source codec (e.g., Opus source to Opus output).
 - **Metadata reuse**: Reuses pre-fetched video info on download instead of fetching it twice.
 - **Smart resume & file skip**: Detects existing completed tracks in destination folder and skips them.
+- **Persistent Deduplication & Library History**: Automatically tracks every downloaded song across YouTube and Spotify in `download_history.json`. When importing playlists, previously downloaded songs are detected and automatically unchecked/omitted. Includes one-click "Omit Duplicates", library folder scanning, and history clearing in Settings.
 - **Multi-threaded worker pool**: Simultaneous downloads queue (1–5 parallel workers, default 3) with per-track and overall progress bars.
 
 ### Spotify Playlist Import (Task B)

@@ -44,8 +44,9 @@ coverage.xml
 *.cover
 *.py,cover
 
-# User configuration & credentials (holds Spotify tokens, paths)
+# User configuration & credentials (holds Spotify tokens, paths, download history)
 config.json
+download_history.json
 
 # Audio downloads & output folders
 DOWNLOAD/

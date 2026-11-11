@@ -48,8 +48,10 @@ class SpotifyTrack:
     matched_channel: str = ""
     score: float = 0.0
     selected: bool = True
-    status: str = "Pending"  # Pending, Downloading, Done, Skipped, Failed, No match
+    status: str = "Pending"  # Pending, Downloading, Done, Skipped, Failed, No match, Already Downloaded
     error_message: str = ""
+    is_duplicate: bool = False
+    duplicate_info: str = ""
 
     @property
     def duration_sec(self) -> float:
@@ -69,6 +71,181 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', "", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned[:150] or "Unknown"
+
+
+# ==============================================================================
+# DOWNLOAD HISTORY & DEDUPLICATION MANAGER
+# ==============================================================================
+
+class DownloadHistoryManager:
+    """Tracks downloaded songs across YouTube and Spotify to avoid duplicate downloads."""
+
+    def __init__(self, history_file: Optional[Path] = None):
+        if history_file is None:
+            self.history_file = Path(__file__).resolve().parent / "download_history.json"
+        else:
+            self.history_file = Path(history_file)
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if self.history_file.is_file():
+            try:
+                with open(self.history_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {
+            "spotify_ids": {},
+            "youtube_ids": {},
+            "normalized_keys": {},
+        }
+
+    def save(self):
+        try:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2)
+        except Exception:
+            pass
+
+    @staticmethod
+    def normalize_key(artist: str = "", title: str = "") -> str:
+        """Create a normalized key to match titles despite punctuation, tags, or remixes."""
+        t = re.sub(r"\(.*?\)|\[.*?\]", "", title or "").strip().lower()
+        a = re.sub(r"\(.*?\)|\[.*?\]", "", artist or "").strip().lower()
+
+        # Remove common trailing tags like - Remastered 2011, - Official Audio, etc.
+        t = re.sub(
+            r"-\s*(remastered|remaster|live|official|audio|video|lyrics|hd|hq).*",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        norm_a = re.sub(r"[^a-z0-9]", "", a)
+        norm_t = re.sub(r"[^a-z0-9]", "", t)
+
+        if norm_a and norm_a not in ("unknown", "unknownartist"):
+            return f"{norm_a}:{norm_t}"
+        return norm_t
+
+    def record_download(
+        self,
+        title: str,
+        artist: str = "",
+        spotify_id: str = "",
+        youtube_id: str = "",
+        file_path: str = "",
+    ):
+        """Record a completed download into history."""
+        record = {
+            "title": title,
+            "artist": artist,
+            "spotify_id": spotify_id,
+            "youtube_id": youtube_id,
+            "file_path": str(file_path),
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if spotify_id:
+            self.data.setdefault("spotify_ids", {})[spotify_id] = record
+        if youtube_id:
+            self.data.setdefault("youtube_ids", {})[youtube_id] = record
+
+        norm_key = self.normalize_key(artist, title)
+        if norm_key:
+            self.data.setdefault("normalized_keys", {})[norm_key] = record
+
+        # Also store with title alone if artist was combined
+        if " - " in title and not artist:
+            parts = title.split(" - ", 1)
+            k2 = self.normalize_key(parts[0], parts[1])
+            if k2:
+                self.data.setdefault("normalized_keys", {})[k2] = record
+
+        self.save()
+
+    def is_downloaded(
+        self,
+        title: str = "",
+        artist: str = "",
+        spotify_id: str = "",
+        youtube_id: str = "",
+    ) -> tuple[bool, Optional[dict]]:
+        """Check if track has already been downloaded by spotify_id, youtube_id, or normalized title."""
+        # 1. Match by Spotify ID
+        if spotify_id and spotify_id in self.data.get("spotify_ids", {}):
+            return True, self.data["spotify_ids"][spotify_id]
+
+        # 2. Match by YouTube Video ID
+        if youtube_id and youtube_id in self.data.get("youtube_ids", {}):
+            return True, self.data["youtube_ids"][youtube_id]
+
+        # 3. Match by normalized key
+        norm_key = self.normalize_key(artist, title)
+        if norm_key and norm_key in self.data.get("normalized_keys", {}):
+            return True, self.data["normalized_keys"][norm_key]
+
+        # 4. Try parsing "Artist - Title" if artist is empty
+        if not artist and " - " in title:
+            parts = title.split(" - ", 1)
+            k2 = self.normalize_key(parts[0], parts[1])
+            if k2 and k2 in self.data.get("normalized_keys", {}):
+                return True, self.data["normalized_keys"][k2]
+
+        return False, None
+
+    def scan_and_index_folder(self, folder: Path) -> int:
+        """Scan a folder for existing audio files and index them into history."""
+        if not folder.is_dir():
+            return 0
+        audio_exts = {".mp3", ".m4a", ".opus", ".flac", ".wav", ".webm", ".ogg"}
+        added = 0
+        try:
+            for item in folder.rglob("*"):
+                if item.is_file() and item.suffix.lower() in audio_exts and item.stat().st_size > 1024:
+                    stem = item.stem
+                    if " - " in stem:
+                        a, t = stem.split(" - ", 1)
+                    else:
+                        a, t = "", stem
+                    norm_key = self.normalize_key(a, t)
+                    if norm_key and norm_key not in self.data.get("normalized_keys", {}):
+                        self.data.setdefault("normalized_keys", {})[norm_key] = {
+                            "title": t.strip(),
+                            "artist": a.strip(),
+                            "file_path": str(item),
+                            "timestamp": time.strftime(
+                                "%Y-%m-%d %H:%M:%S", time.localtime(item.stat().st_mtime)
+                            ),
+                        }
+                        added += 1
+            if added > 0:
+                self.save()
+        except Exception:
+            pass
+        return added
+
+    def clear(self):
+        """Clear all download history."""
+        self.data = {"spotify_ids": {}, "youtube_ids": {}, "normalized_keys": {}}
+        self.save()
+
+    def count(self) -> int:
+        """Return total unique tracks in history."""
+        keys = set(self.data.get("normalized_keys", {}).keys())
+        keys.update(self.data.get("spotify_ids", {}).keys())
+        keys.update(self.data.get("youtube_ids", {}).keys())
+        return len(keys)
+
+
+_GLOBAL_HISTORY: Optional[DownloadHistoryManager] = None
+
+
+def get_download_history(history_file: Optional[Path] = None) -> DownloadHistoryManager:
+    """Get the global singleton DownloadHistoryManager instance."""
+    global _GLOBAL_HISTORY
+    if _GLOBAL_HISTORY is None or history_file is not None:
+        _GLOBAL_HISTORY = DownloadHistoryManager(history_file)
+    return _GLOBAL_HISTORY
 
 
 # ==============================================================================

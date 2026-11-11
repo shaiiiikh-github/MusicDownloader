@@ -40,6 +40,7 @@ from spotify_import import (
     fetch_playlist_embed,
     fetch_playlist_web_api,
     get_aria2c_path,
+    get_download_history,
     match_track_to_youtube,
     parse_exportify_csv,
     parse_plain_text_tracks,
@@ -117,6 +118,14 @@ class App(ctk.CTk):
         self.cfg = load_config()
         self.out_dir = Path(self.cfg.get("download_dir", str(Path.home() / "Downloads")))
         self.cached_info = None  # Reusing already fetched video info (Task A.5)
+
+        # Persistent Download History & Deduplication
+        self.history = get_download_history()
+        threading.Thread(
+            target=self.history.scan_and_index_folder,
+            args=(self.out_dir,),
+            daemon=True,
+        ).start()
 
         self._build_ui()
         self.after(100, self._poll)
@@ -318,6 +327,12 @@ class App(ctk.CTk):
         clean_name = sanitize_filename(expected_title)
         existing = track_already_exists(self.out_dir, clean_name, codec)
         if existing:
+            self.history.record_download(
+                title=expected_title,
+                artist=self.cached_info.get("uploader", "") if self.cached_info else "",
+                youtube_id=self.cached_info.get("id", "") if self.cached_info else "",
+                file_path=str(existing),
+            )
             self.q.put(("done", f"File already exists: {existing.name} (Skipped)"))
             return
 
@@ -358,6 +373,15 @@ class App(ctk.CTk):
                     ydl.process_ie_result(self.cached_info, download=True)
                 else:
                     ydl.download([url])
+
+            # Record download into persistent history
+            self.history.record_download(
+                title=expected_title,
+                artist=self.cached_info.get("uploader", "") if self.cached_info else "",
+                youtube_id=self.cached_info.get("id", "") if self.cached_info else "",
+                file_path=str(self.out_dir / f"{clean_name}.{codec or 'audio'}"),
+            )
+
             self.q.put(("done", f"Saved to {self.out_dir}"))
         except DownloadError as e:
             self.q.put(("error", self._clean(e)))
@@ -378,14 +402,26 @@ class App(ctk.CTk):
                 if kind == "info":
                     _, info, img = msg
                     self.title_lbl.configure(text=info.get("title", "Unknown"))
-                    self.meta_lbl.configure(
-                        text=f"{info.get('uploader', '')}  •  {fmt_duration(info.get('duration'))}"
+                    
+                    is_dl, rec = self.history.is_downloaded(
+                        title=info.get("title", ""),
+                        youtube_id=info.get("id", ""),
                     )
+                    meta_text = f"{info.get('uploader', '')}  •  {fmt_duration(info.get('duration'))}"
+                    if is_dl:
+                        meta_text += f"  •  ✓ In library ({rec.get('timestamp', '')[:10]})"
+                        self.btn.configure(text="Download Again")
+                        self.status.configure(text="Track already in your library!", text_color="#1DB954")
+                    else:
+                        self.btn.configure(text="Download")
+                        self.status.configure(text="Ready to download", text_color="gray")
+
+                    self.meta_lbl.configure(text=meta_text)
                     if img:
                         img.thumbnail((160, 90))
                         self.thumb_img = ctk.CTkImage(img, size=img.size)
                         self.thumb.configure(image=self.thumb_img)
-                    self._set_busy(False, "Ready to download")
+                    self._set_busy(False)
                 elif kind == "progress":
                     self.bar.set(msg[1])
                     self.status.configure(text=msg[2], text_color="gray")
@@ -424,7 +460,7 @@ class SettingsDialog(ctk.CTkToplevel):
         super().__init__(master)
         self.master_app = master
         self.title("Settings")
-        self.geometry("480x420")
+        self.geometry("500x530")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
@@ -488,7 +524,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         # Accelerators Status
         env_frame = ctk.CTkFrame(self)
-        env_frame.pack(fill="x", pady=14, **pad)
+        env_frame.pack(fill="x", pady=8, **pad)
         ctk.CTkLabel(
             env_frame,
             text=f"Aria2c Acceleration: {'Detected (16x parallel)' if self.master_app.aria2c_path else 'Not found (Using built-in)'}",
@@ -500,9 +536,40 @@ class SettingsDialog(ctk.CTkToplevel):
             anchor="w",
         ).pack(fill="x", padx=12, pady=(2, 8))
 
+        # Library & Download History (Deduplication)
+        hist_frame = ctk.CTkFrame(self)
+        hist_frame.pack(fill="x", pady=8, **pad)
+
+        self.hist_lbl = ctk.CTkLabel(
+            hist_frame,
+            text=f"Library History: {self.master_app.history.count()} songs indexed",
+            font=ctk.CTkFont(weight="bold"),
+            anchor="w",
+        )
+        self.hist_lbl.pack(fill="x", padx=12, pady=(8, 4))
+
+        btn_box = ctk.CTkFrame(hist_frame, fg_color="transparent")
+        btn_box.pack(fill="x", padx=12, pady=(0, 8))
+
+        ctk.CTkButton(
+            btn_box,
+            text="Scan Download Folder",
+            width=150,
+            command=self.scan_folder,
+        ).pack(side="left", padx=(0, 6))
+
+        ctk.CTkButton(
+            btn_box,
+            text="Clear History",
+            width=100,
+            fg_color="#c62828",
+            hover_color="#b71c1c",
+            command=self.clear_history,
+        ).pack(side="left")
+
         # Save Button
         ctk.CTkButton(self, text="Save Settings", height=36, command=self.save).pack(
-            fill="x", pady=16, **pad
+            fill="x", pady=12, **pad
         )
 
     def start_pkce_flow(self):
@@ -563,6 +630,17 @@ class SettingsDialog(ctk.CTkToplevel):
                 self.after(0, lambda: self.pkce_btn.configure(state="normal", text="Authorize with Spotify (PKCE)"))
 
         threading.Thread(target=run_auth_server, daemon=True).start()
+
+    def scan_folder(self):
+        added = self.master_app.history.scan_and_index_folder(self.master_app.out_dir)
+        self.hist_lbl.configure(text=f"Library History: {self.master_app.history.count()} songs indexed")
+        messagebox.showinfo("Scan Complete", f"Scanned library folder.\nIndexed {added} new audio files into history!")
+
+    def clear_history(self):
+        if messagebox.askyesno("Clear History", "Are you sure you want to clear your download history?"):
+            self.master_app.history.clear()
+            self.hist_lbl.configure(text="Library History: 0 songs indexed")
+            messagebox.showinfo("History Cleared", "Download history has been reset.")
 
     def save(self):
         self.master_app.cfg["simultaneous_downloads"] = int(self.sim_opt.get())
@@ -686,7 +764,16 @@ class SpotifyImportDialog(ctk.CTkToplevel):
             command=self.deselect_all_tracks,
             state="disabled",
         )
-        self.deselect_all_btn.pack(side="left")
+        self.deselect_all_btn.pack(side="left", padx=(0, 6))
+
+        self.omit_duplicates_btn = ctk.CTkButton(
+            self.action_frame,
+            text="Omit Duplicates",
+            width=115,
+            command=self.omit_duplicate_tracks,
+            state="disabled",
+        )
+        self.omit_duplicates_btn.pack(side="left")
 
         self.download_btn = ctk.CTkButton(
             self.action_frame,
@@ -800,9 +887,23 @@ class SpotifyImportDialog(ctk.CTkToplevel):
                     track.matched_url = best_cand.get("webpage_url") or f"https://www.youtube.com/watch?v={track.matched_id}"
                     track.matched_channel = best_cand.get("uploader") or best_cand.get("channel") or ""
                     track.score = score
-                    track.status = "Pending"
-                    track.selected = True
-                    matched_count += 1
+
+                    # Deduplication: check if track is already in download history
+                    is_dl, rec = self.master_app.history.is_downloaded(
+                        title=track.title,
+                        artist=track.artists,
+                        spotify_id=track.id,
+                        youtube_id=track.matched_id,
+                    )
+                    if is_dl:
+                        track.is_duplicate = True
+                        track.duplicate_info = f"Already downloaded ({rec.get('timestamp', '')[:10]})"
+                        track.status = "Already Downloaded"
+                        track.selected = False  # Automatically omit duplicates!
+                    else:
+                        track.status = "Pending"
+                        track.selected = True
+                        matched_count += 1
                 else:
                     track.status = "No match"
                     track.selected = False
@@ -832,12 +933,23 @@ class SpotifyImportDialog(ctk.CTkToplevel):
             w.destroy()
         self.track_widgets.clear()
 
-        matched = sum(1 for t in self.tracks if t.status != "No match")
+        matched_new = sum(1 for t in self.tracks if t.matched_url and not t.is_duplicate)
+        duplicates = sum(1 for t in self.tracks if t.is_duplicate)
         self.pl_title_lbl.configure(text=f"{self.playlist_name} ({len(self.tracks)} tracks)")
-        self.status_lbl.configure(
-            text=f"Review matches: {matched}/{len(self.tracks)} matched. Untick or edit any match before downloading.",
-            text_color="gray",
-        )
+
+        if duplicates > 0:
+            self.status_lbl.configure(
+                text=f"Review matches: {matched_new} ready to download, {duplicates} omitted (already in library).",
+                text_color="#1DB954" if matched_new > 0 else "gray",
+            )
+            self.omit_duplicates_btn.configure(state="normal")
+        else:
+            self.status_lbl.configure(
+                text=f"Review matches: {matched_new}/{len(self.tracks)} matched. Untick or edit any match before downloading.",
+                text_color="gray",
+            )
+            self.omit_duplicates_btn.configure(state="disabled")
+
         self.overall_bar.set(0)
 
         for track in self.tracks:
@@ -909,7 +1021,13 @@ class SpotifyImportDialog(ctk.CTkToplevel):
         if not w:
             return
 
-        if track.matched_url:
+        if track.is_duplicate:
+            w["yt_lbl"].configure(
+                text=f"Matched: {track.matched_title}  ({fmt_duration(track.matched_duration)})  •  {track.duplicate_info}",
+                text_color="#ba68c8",
+            )
+            w["status_lbl"].configure(text="In Library", text_color="#ba68c8")
+        elif track.matched_url:
             w["yt_lbl"].configure(
                 text=f"Matched: {track.matched_title}  ({fmt_duration(track.matched_duration)})",
                 text_color="gray",
@@ -918,6 +1036,13 @@ class SpotifyImportDialog(ctk.CTkToplevel):
         else:
             w["yt_lbl"].configure(text="No match found on YouTube", text_color="#e53935")
             w["status_lbl"].configure(text="No match", text_color="#e53935")
+
+    def omit_duplicate_tracks(self):
+        for t in self.tracks:
+            if t.is_duplicate and t.id in self.track_widgets:
+                t.selected = False
+                self.track_widgets[t.id]["var"].set(False)
+        self._update_download_btn_text()
 
     def edit_track_url(self, track: SpotifyTrack, yt_lbl, status_lbl, var):
         dialog = ctk.CTkInputDialog(
@@ -1035,6 +1160,13 @@ class SpotifyImportDialog(ctk.CTkToplevel):
                 with lock:
                     skipped_count += 1
                 track.status = "Skipped"
+                self.master_app.history.record_download(
+                    title=track.title,
+                    artist=track.artists,
+                    spotify_id=track.id,
+                    youtube_id=track.matched_id,
+                    file_path=str(existing),
+                )
                 self.after(0, lambda: self._set_track_status(track.id, 1.0, "Skipped", "#388e3c"))
                 update_overall()
                 return
@@ -1083,6 +1215,16 @@ class SpotifyImportDialog(ctk.CTkToplevel):
                 with lock:
                     completed_count += 1
                 track.status = "Done"
+
+                # Record in persistent history
+                self.master_app.history.record_download(
+                    title=track.title,
+                    artist=track.artists,
+                    spotify_id=track.id,
+                    youtube_id=track.matched_id,
+                    file_path=str(folder / f"{track.safe_filename_base}.{codec or 'audio'}"),
+                )
+
                 self.after(0, lambda: self._set_track_status(track.id, 1.0, "Done", "#1DB954"))
             except Exception as e:
                 with lock:
